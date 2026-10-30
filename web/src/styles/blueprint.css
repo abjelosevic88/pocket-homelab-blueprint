@@ -467,3 +467,6 @@ table.src tr.hl .ln { color: var(--accent-ink); font-weight: 600; }
 }
 .table.cols td:first-child { white-space: nowrap; }
 .table.cols .pk { display: inline-block; }
+/* Settings section icons: accent on a soft tile (an app colour given inline keeps white) */
+.set-section-head .set-app-ico { background: var(--accent-soft); color: var(--accent-ink); }
+.set-section-head .set-app-ico[style] { color: #fff; }
