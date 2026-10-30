@@ -1,0 +1,27 @@
+# Pocket Blueprint — see how a codebase is built (Go + SQLite). One container, one volume.
+services:
+  pocket-blueprint:
+    image: ghcr.io/abjelosevic88/pocket-homelab-blueprint:latest
+    container_name: pocket-blueprint
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      BASE_URL: ${BASE_URL:-http://localhost:8080}
+      # SECURE_COOKIES: "true"          # behind HTTPS
+      # First admin (only used while the database has no users):
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Folders on this server admins may scan (mounted read-only below):
+      # SOURCE_ROOTS: /code
+      NOTIFY_URL: ${NOTIFY_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Pocket Core: one sign-in, Pocket Files folders, Pocket AI, and other apps reading your scans.
+      # CORE_URL: http://pocket-core:8080
+      # CORE_REGISTRATION_KEY: ${CORE_REGISTRATION_KEY}
+    volumes:
+      - ./data:/data
+      # - ~/code:/code:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,5 @@
+# web
+Flask==3.0.2
+Django>=5.0  # framework
+requests[socks]>=2.31 ; python_version > "3.8"
+-e git+https://example.com/x.git#egg=x

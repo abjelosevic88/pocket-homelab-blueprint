@@ -1,0 +1,5 @@
+# Pocket Blueprint behind Caddy. Homepage widgets and linked apps send their own
+# bearer token to /api/*.
+blueprint.example.com {
+	reverse_proxy pocket-blueprint:8080
+}

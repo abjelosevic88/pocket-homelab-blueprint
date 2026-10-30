@@ -1,0 +1,827 @@
+Northwind Shop, later: payments (billing), coupons, e-mails, a Python worker
+for payment webhooks, an OpenAPI document and docker compose.
+-- README.md --
+# Northwind Shop
+
+A small online shop: a Go API (`cmd/shop`), a React storefront (`web/`) and a
+Python worker (`worker/`) that takes payment webhooks and sends e-mails.
+
+Configuration is read from the environment, see `.env.example`.
+`PORT`, `DATABASE_URL`, `JWT_SECRET` and `STRIPE_SECRET_KEY` are required.
+
+    docker compose up
+-- .env.example --
+PORT=8080
+DATABASE_URL=file:shop.db
+JWT_SECRET=change-me
+SMTP_HOST=mailpit
+STRIPE_SECRET_KEY=sk_test_...
+REDIS_URL=redis://redis:6379
+-- docker-compose.yml --
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: file:/data/shop.db
+      JWT_SECRET: ${JWT_SECRET}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+  web:
+    build: ./web
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+  worker:
+    build: ./worker
+    environment:
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: mailpit
+    depends_on:
+      - redis
+      - mailpit
+  redis:
+    image: redis:7-alpine
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"
+-- openapi.yaml --
+openapi: 3.0.3
+info:
+  title: Northwind Shop public API
+  version: 1.2.0
+servers:
+  - url: https://shop.example.com/api/v1
+paths:
+  /products:
+    get:
+      summary: List products
+      tags: [catalog]
+  /products/{id}:
+    get:
+      summary: One product
+      tags: [catalog]
+  /orders:
+    get:
+      summary: Your orders
+      tags: [orders]
+    post:
+      summary: Place an order
+      tags: [orders]
+  /coupons/{code}:
+    get:
+      summary: Check a coupon
+      tags: [checkout]
+-- internal/config/config.go --
+// Package config reads the shop's settings from the environment.
+package config
+
+import "os"
+
+// Config is everything the shop needs to start.
+type Config struct {
+	Port          string
+	DatabaseURL   string
+	JWTSecret     string
+	SMTPHost      string
+	StripeKey     string
+	WebhookSecret string
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// Load reads the environment.
+func Load() Config {
+	return Config{
+		Port:          env("PORT", "8080"),
+		DatabaseURL:   env("DATABASE_URL", "file:shop.db"),
+		JWTSecret:     os.Getenv("JWT_SECRET"),
+		SMTPHost:      env("SMTP_HOST", "localhost"),
+		StripeKey:     os.Getenv("STRIPE_SECRET_KEY"),
+		WebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
+	}
+}
+-- internal/api/router.go --
+// Package api is the shop's HTTP API.
+package api
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/northwind/shop/internal/billing"
+	"github.com/northwind/shop/internal/config"
+	"github.com/northwind/shop/internal/mail"
+	"github.com/northwind/shop/internal/store"
+)
+
+// Server holds what the handlers need.
+type Server struct {
+	cfg     config.Config
+	store   *store.Store
+	billing *billing.Client
+	mail    *mail.Sender
+}
+
+// New creates the API server.
+func New(cfg config.Config, st *store.Store) *Server {
+	return &Server{cfg: cfg, store: st, billing: billing.New(cfg.StripeKey, st), mail: mail.New(cfg.SMTPHost)}
+}
+
+// Router builds every route.
+func (s *Server) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.Logger, middleware.Recoverer)
+	r.Get("/healthz", s.handleHealth)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Post("/auth/login", s.handleLogin)
+		r.Post("/auth/register", s.handleRegister)
+
+		r.Get("/products", s.handleListProducts)
+		r.Get("/products/{id}", s.handleGetProduct)
+		r.Get("/coupons/{code}", s.handleCheckCoupon)
+		r.Post("/webhooks/stripe", s.handleStripeWebhook)
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAuth)
+			r.Get("/me", s.handleMe)
+			r.Route("/orders", func(r chi.Router) {
+				r.Get("/", s.handleListOrders)
+				r.Post("/", s.handleCreateOrder)
+				r.Get("/{id}", s.handleGetOrder)
+				r.Post("/{id}/cancel", s.handleCancelOrder)
+				r.Post("/{id}/pay", s.handlePayOrder)
+			})
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAuth, s.requireAdmin)
+			r.Post("/products", s.handleCreateProduct)
+			r.Put("/products/{id}", s.handleUpdateProduct)
+			r.Delete("/products/{id}", s.handleDeleteProduct)
+			r.Get("/coupons", s.handleListCoupons)
+			r.Post("/coupons", s.handleCreateCoupon)
+		})
+	})
+	return r
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+-- internal/api/coupons.go --
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+func (s *Server) handleCheckCoupon(w http.ResponseWriter, r *http.Request) {
+	c, err := s.store.CouponByCode(chi.URLParam(r, "code"))
+	if err != nil || !c.Valid() {
+		writeErr(w, http.StatusNotFound, "this coupon is not valid")
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) handleListCoupons(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListCoupons()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleCreateCoupon(w http.ResponseWriter, r *http.Request) {
+	var c store.Coupon
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := s.store.SaveCoupon(&c); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, c)
+}
+-- internal/api/payments.go --
+package api
+
+import (
+	"io"
+	"net/http"
+)
+
+// handlePayOrder starts a card payment for an order.
+func (s *Server) handlePayOrder(w http.ResponseWriter, r *http.Request) {
+	o, err := s.store.GetOrder(customer(r).ID, idParam(r))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such order")
+		return
+	}
+	intent, err := s.billing.Charge(o)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, intent)
+}
+
+// handleStripeWebhook marks orders paid when Stripe says so.
+func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	order, err := s.billing.HandleWebhook(body, r.Header.Get("Stripe-Signature"), s.cfg.WebhookSecret)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if order != nil {
+		// FIXME: send this from the worker so a slow mail server cannot time out the webhook
+		_ = s.mail.Send(order.CustomerEmail, "Thank you for your order", "We received your payment.")
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+-- internal/api/orders.go --
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+func (s *Server) handleListOrders(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.OrdersOf(customer(r).ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Items  []store.OrderItem `json:"items"`
+		Coupon string            `json:"coupon"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || len(in.Items) == 0 {
+		writeErr(w, http.StatusBadRequest, "add something to the cart first")
+		return
+	}
+	o, err := s.store.CreateOrder(customer(r).ID, in.Items, in.Coupon)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, o)
+}
+
+func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
+	o, err := s.store.GetOrder(customer(r).ID, idParam(r))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such order")
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+
+func (s *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
+	o, err := s.store.GetOrder(customer(r).ID, idParam(r))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such order")
+		return
+	}
+	if o.Status == "paid" {
+		if err := s.billing.Refund(o); err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	if err := s.store.CancelOrder(customer(r).ID, o.ID); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+-- internal/billing/stripe.go --
+// Package billing takes card payments through Stripe.
+package billing
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+// Client charges and refunds orders.
+type Client struct {
+	key   string
+	store *store.Store
+}
+
+// Intent is a payment the browser completes.
+type Intent struct {
+	ID           string `json:"id"`
+	ClientSecret string `json:"client_secret"`
+	AmountCents  int64  `json:"amount_cents"`
+}
+
+// New creates the billing client.
+func New(key string, st *store.Store) *Client {
+	return &Client{key: key, store: st}
+}
+
+// Charge creates a payment intent for an order.
+func (c *Client) Charge(o *store.Order) (*Intent, error) {
+	if c.key == "" {
+		return nil, errors.New("payments are not set up")
+	}
+	amount := store.Total(o)
+	// TODO: call the Stripe API; this returns a fake intent for now
+	return &Intent{ID: fmt.Sprintf("pi_%d", o.ID), ClientSecret: "secret", AmountCents: amount}, nil
+}
+
+// Refund gives the money for a paid order back.
+func (c *Client) Refund(o *store.Order) error {
+	if o.Status != "paid" {
+		return errors.New("only paid orders can be refunded")
+	}
+	return c.store.SetOrderStatus(o.ID, "refunded")
+}
+
+// HandleWebhook checks a Stripe event and marks the order paid.
+func (c *Client) HandleWebhook(body []byte, signature, secret string) (*store.Order, error) {
+	if !validSignature(body, signature, secret) {
+		return nil, errors.New("bad signature")
+	}
+	id, ok := orderIDFrom(body)
+	if !ok {
+		return nil, nil
+	}
+	if err := c.store.SetOrderStatus(id, "paid"); err != nil {
+		return nil, err
+	}
+	return c.store.OrderByID(id)
+}
+-- internal/billing/webhook.go --
+package billing
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+)
+
+func validSignature(body []byte, header, secret string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	want := hex.EncodeToString(mac.Sum(nil))
+	for _, part := range strings.Split(header, ",") {
+		if strings.TrimPrefix(part, "v1=") == want {
+			return true
+		}
+	}
+	return false
+}
+
+func orderIDFrom(body []byte) (int64, bool) {
+	var ev struct {
+		Type string `json:"type"`
+		Data struct {
+			Object struct {
+				Metadata map[string]int64 `json:"metadata"`
+			} `json:"object"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &ev) != nil || ev.Type != "payment_intent.succeeded" {
+		return 0, false
+	}
+	id, ok := ev.Data.Object.Metadata["order_id"]
+	return id, ok
+}
+-- internal/billing/prices.go --
+package billing
+
+// Discount applies a coupon's percentage to an amount in cents.
+func Discount(amountCents int64, percent int) int64 {
+	if percent <= 0 {
+		return amountCents
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	return amountCents - amountCents*int64(percent)/100
+}
+-- internal/mail/mail.go --
+// Package mail sends the shop's e-mails.
+package mail
+
+import (
+	"fmt"
+	"net/smtp"
+)
+
+// Sender sends plain-text e-mails through an SMTP server.
+type Sender struct {
+	host string
+}
+
+// New creates a sender.
+func New(host string) *Sender { return &Sender{host: host} }
+
+// Send delivers one e-mail.
+func (s *Sender) Send(to, subject, body string) error {
+	msg := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", to, subject, body)
+	return smtp.SendMail(s.host+":25", nil, "shop@northwind.example", []string{to}, []byte(msg))
+}
+-- internal/store/coupons.go --
+package store
+
+import "time"
+
+// Coupon gives a percentage off an order.
+type Coupon struct {
+	ID        int64  `json:"id"`
+	Code      string `json:"code"`
+	Percent   int    `json:"percent"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// Valid reports whether the coupon can still be used.
+func (c *Coupon) Valid() bool {
+	t, err := time.Parse(time.RFC3339, c.ExpiresAt)
+	return err != nil || time.Now().Before(t)
+}
+
+// CouponByCode finds a coupon.
+func (s *Store) CouponByCode(code string) (*Coupon, error) {
+	var c Coupon
+	err := s.db.QueryRow(`SELECT id, code, percent, expires_at FROM coupons WHERE code = ?`, code).Scan(&c.ID, &c.Code, &c.Percent, &c.ExpiresAt)
+	return &c, err
+}
+
+// ListCoupons returns every coupon.
+func (s *Store) ListCoupons() ([]Coupon, error) {
+	rows, err := s.db.Query(`SELECT id, code, percent, expires_at FROM coupons ORDER BY code`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Coupon
+	for rows.Next() {
+		var c Coupon
+		if err := rows.Scan(&c.ID, &c.Code, &c.Percent, &c.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SaveCoupon adds a coupon.
+func (s *Store) SaveCoupon(c *Coupon) error {
+	res, err := s.db.Exec(`INSERT INTO coupons (code, percent, expires_at) VALUES (?, ?, ?)`, c.Code, c.Percent, c.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	c.ID, _ = res.LastInsertId()
+	return nil
+}
+-- internal/store/orders.go --
+package store
+
+import (
+	"errors"
+
+	"github.com/northwind/shop/internal/billing"
+)
+
+// Order is a customer's purchase.
+type Order struct {
+	ID            int64       `json:"id"`
+	CustomerID    int64       `json:"customer_id"`
+	CustomerEmail string      `json:"-"`
+	Status        string      `json:"status"`
+	TotalCents    int64       `json:"total_cents"`
+	CouponID      *int64      `json:"coupon_id"`
+	Items         []OrderItem `json:"items"`
+}
+
+// OrderItem is one line of an order.
+type OrderItem struct {
+	ProductID int64 `json:"product_id"`
+	Quantity  int   `json:"quantity"`
+}
+
+// Total is what the customer pays.
+func Total(o *Order) int64 { return o.TotalCents }
+
+// OrdersOf lists a customer's orders.
+func (s *Store) OrdersOf(customerID int64) ([]Order, error) {
+	rows, err := s.db.Query(`SELECT id, customer_id, status, total_cents FROM orders WHERE customer_id = ? ORDER BY id DESC`, customerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// CreateOrder places an order, applies a coupon and lowers the stock.
+func (s *Store) CreateOrder(customerID int64, items []OrderItem, coupon string) (*Order, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var total int64
+	for _, it := range items {
+		var price int64
+		var stock int
+		if err := tx.QueryRow(`SELECT price_cents, stock FROM products WHERE id = ?`, it.ProductID).Scan(&price, &stock); err != nil {
+			return nil, err
+		}
+		if stock < it.Quantity {
+			return nil, errors.New("not enough in stock")
+		}
+		total += price * int64(it.Quantity)
+	}
+	var couponID *int64
+	if coupon != "" {
+		c, err := s.CouponByCode(coupon)
+		if err != nil || !c.Valid() {
+			return nil, errors.New("this coupon is not valid")
+		}
+		total = billing.Discount(total, c.Percent)
+		couponID = &c.ID
+	}
+	res, err := tx.Exec(`INSERT INTO orders (customer_id, status, total_cents, coupon_id) VALUES (?, 'new', ?, ?)`, customerID, total, couponID)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	for _, it := range items {
+		if _, err := tx.Exec(`INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)`, id, it.ProductID, it.Quantity); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`UPDATE products SET stock = stock - ? WHERE id = ?`, it.Quantity, it.ProductID); err != nil {
+			return nil, err
+		}
+	}
+	return &Order{ID: id, CustomerID: customerID, Status: "new", TotalCents: total, CouponID: couponID, Items: items}, tx.Commit()
+}
+
+// GetOrder returns one of the customer's orders.
+func (s *Store) GetOrder(customerID, id int64) (*Order, error) {
+	var o Order
+	err := s.db.QueryRow(`SELECT id, customer_id, status, total_cents FROM orders WHERE id = ? AND customer_id = ?`, id, customerID).Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents)
+	return &o, err
+}
+
+// OrderByID returns any order with its customer's e-mail (for webhooks).
+func (s *Store) OrderByID(id int64) (*Order, error) {
+	var o Order
+	err := s.db.QueryRow(`SELECT o.id, o.customer_id, c.email, o.status, o.total_cents FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id = ?`, id).
+		Scan(&o.ID, &o.CustomerID, &o.CustomerEmail, &o.Status, &o.TotalCents)
+	return &o, err
+}
+
+// SetOrderStatus moves an order to a new status.
+func (s *Store) SetOrderStatus(id int64, status string) error {
+	_, err := s.db.Exec(`UPDATE orders SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+// CancelOrder cancels an order that has not shipped.
+func (s *Store) CancelOrder(customerID, id int64) error {
+	res, err := s.db.Exec(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND customer_id = ? AND status IN ('new','refunded')`, id, customerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("this order can no longer be cancelled")
+	}
+	return nil
+}
+-- migrations/0002_coupons.sql --
+CREATE TABLE coupons (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  code       TEXT NOT NULL UNIQUE,
+  percent    INTEGER NOT NULL CHECK (percent BETWEEN 1 AND 100),
+  expires_at TEXT NOT NULL DEFAULT ''
+);
+
+ALTER TABLE orders ADD COLUMN coupon_id INTEGER REFERENCES coupons(id);
+
+CREATE TABLE payments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id    INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL,
+  amount      INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+-- web/src/api/client.ts --
+// Talks to the shop API.
+export interface Product { id: number; name: string; description: string; price_cents: number; stock: number }
+export interface OrderItem { product_id: number; quantity: number }
+export interface Order { id: number; status: string; total_cents: number; items: OrderItem[] }
+export interface Coupon { code: string; percent: number }
+
+const BASE = import.meta.env.VITE_API_URL || '/api/v1'
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error((await res.json()).error || res.statusText)
+  return res.status === 204 ? (undefined as T) : res.json()
+}
+
+export const listProducts = (q = '') => request<Product[]>('GET', `/products?q=${encodeURIComponent(q)}`)
+export const getProduct = (id: number) => request<Product>('GET', `/products/${id}`)
+export const listOrders = () => request<Order[]>('GET', '/orders')
+export const createOrder = (items: OrderItem[], coupon = '') => request<Order>('POST', '/orders', { items, coupon })
+export const cancelOrder = (id: number) => request<void>('POST', `/orders/${id}/cancel`)
+export const payOrder = (id: number) => request<{ client_secret: string }>('POST', `/orders/${id}/pay`)
+export const checkCoupon = (code: string) => request<Coupon>('GET', `/coupons/${encodeURIComponent(code)}`)
+-- web/src/pages/Cart.tsx --
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { checkCoupon, createOrder, payOrder } from '@/api/client'
+import { CouponField } from '@/components/CouponField'
+import { useCart } from '@/hooks/useCart'
+
+export default function Cart() {
+  const cart = useCart()
+  const navigate = useNavigate()
+  const [coupon, setCoupon] = useState('')
+  const checkout = async () => {
+    if (coupon) await checkCoupon(coupon)
+    const order = await createOrder(cart.items, coupon)
+    await payOrder(order.id)
+    cart.clear()
+    navigate('/orders')
+  }
+  return (
+    <main>
+      <h1>Your cart</h1>
+      <ul>{cart.items.map(i => <li key={i.product_id}>#{i.product_id} × {i.quantity}</li>)}</ul>
+      <CouponField value={coupon} onChange={setCoupon} />
+      <button disabled={cart.items.length === 0} onClick={checkout}>Pay now</button>
+    </main>
+  )
+}
+-- web/src/components/CouponField.tsx --
+export function CouponField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <label className="coupon">
+      Coupon <input value={value} onChange={e => onChange(e.target.value.toUpperCase())} placeholder="SPRING10" />
+    </label>
+  )
+}
+-- worker/pyproject.toml --
+[project]
+name = "northwind-worker"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "redis>=5.0",
+  "pydantic-settings>=2.2",
+]
+-- worker/app/__init__.py --
+-- worker/app/main.py --
+"""The worker: payment webhooks in, e-mails out."""
+from fastapi import FastAPI
+
+from .hooks import router as hooks_router
+from .settings import settings
+
+app = FastAPI(title="Northwind worker")
+app.include_router(hooks_router)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "queue": settings.redis_url}
+-- worker/app/hooks.py --
+"""Webhooks from the payment provider and the shop API."""
+from fastapi import APIRouter, Request
+
+from . import jobs
+
+router = APIRouter(prefix="/hooks")
+
+
+@router.post("/stripe")
+async def stripe_event(request: Request):
+    event = await request.json()
+    if event.get("type") == "payment_intent.succeeded":
+        jobs.enqueue("send_receipt", event["data"]["object"]["metadata"])
+    return {"received": True}
+
+
+@router.post("/orders/{order_id}/shipped")
+def order_shipped(order_id: int):
+    jobs.enqueue("send_shipping_mail", {"order_id": order_id})
+    return {"queued": True}
+-- worker/app/jobs.py --
+"""A tiny job queue on Redis."""
+import json
+import os
+
+import redis
+
+from .emails import send_receipt, send_shipping_mail
+
+_queue = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+
+HANDLERS = {"send_receipt": send_receipt, "send_shipping_mail": send_shipping_mail}
+
+
+def enqueue(name, payload):
+    _queue.rpush("jobs", json.dumps({"name": name, "payload": payload}))
+
+
+def run_forever():
+    while True:
+        _, raw = _queue.blpop("jobs")
+        job = json.loads(raw)
+        HANDLERS[job["name"]](**job["payload"])
+-- worker/app/emails.py --
+"""E-mails the worker sends."""
+import os
+import smtplib
+from email.message import EmailMessage
+
+SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
+
+
+def _send(to, subject, body):
+    msg = EmailMessage()
+    msg["To"], msg["Subject"], msg["From"] = to, subject, "shop@northwind.example"
+    msg.set_content(body)
+    with smtplib.SMTP(SMTP_HOST) as s:
+        s.send_message(msg)
+
+
+def send_receipt(order_id, email=""):
+    _send(email, f"Receipt for order {order_id}", "Thank you for your order.")
+
+
+def send_shipping_mail(order_id):
+    # TODO: look up the customer's address in the shop API
+    _send("", f"Order {order_id} is on its way", "Your order has shipped.")
+-- worker/app/settings.py --
+"""Settings from the environment."""
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    redis_url: str = "redis://localhost:6379"
+    smtp_host: str = "localhost"
+
+
+settings = Settings()
+-- worker/Dockerfile --
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install .
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

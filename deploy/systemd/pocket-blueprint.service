@@ -1,0 +1,23 @@
+[Unit]
+Description=Pocket Blueprint — see how a codebase is built
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pocket-blueprint
+Group=pocket-blueprint
+ExecStart=/usr/local/bin/pocket-blueprint
+Environment=DATA_DIR=/var/lib/pocket-blueprint
+Environment=PORT=8080
+Environment=BASE_URL=https://time.example.com
+Environment=SECURE_COOKIES=true
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pocket-blueprint
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,844 @@
+Northwind Shop, first version: the Go API, the store and the web shop.
+-- README.md --
+# Northwind Shop
+
+A small online shop: a Go API (`cmd/shop`), a React storefront (`web/`) and,
+later, a Python worker for payment webhooks.
+
+Configuration is read from the environment, see `.env.example`.
+`PORT`, `DATABASE_URL` and `JWT_SECRET` are required.
+
+    make run
+-- go.mod --
+module github.com/northwind/shop
+
+go 1.22
+
+require (
+	github.com/go-chi/chi/v5 v5.0.12
+	github.com/golang-jwt/jwt/v5 v5.2.1
+	modernc.org/sqlite v1.29.5
+)
+-- Makefile --
+run:
+	go run ./cmd/shop
+
+test:
+	go test ./...
+
+web:
+	cd web && npm run build
+
+migrate:
+	go run ./cmd/shop migrate
+-- Dockerfile --
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY . .
+RUN go build -o /shop ./cmd/shop
+
+FROM alpine:3.19
+COPY --from=build /shop /usr/local/bin/shop
+EXPOSE 8080
+CMD ["shop", "serve"]
+-- .env.example --
+PORT=8080
+DATABASE_URL=file:shop.db
+JWT_SECRET=change-me
+SMTP_HOST=localhost
+-- cmd/shop/main.go --
+// Command shop runs the Northwind Shop API.
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/northwind/shop/internal/api"
+	"github.com/northwind/shop/internal/config"
+	"github.com/northwind/shop/internal/store"
+)
+
+func main() {
+	cfg := config.Load()
+	st, err := store.Open(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := st.Migrate(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	srv := api.New(cfg, st)
+	log.Printf("listening on :%s", cfg.Port)
+	log.Fatal(http.ListenAndServe(":"+cfg.Port, srv.Router()))
+}
+-- internal/config/config.go --
+// Package config reads the shop's settings from the environment.
+package config
+
+import "os"
+
+// Config is everything the shop needs to start.
+type Config struct {
+	Port        string
+	DatabaseURL string
+	JWTSecret   string
+	SMTPHost    string
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// Load reads the environment.
+func Load() Config {
+	return Config{
+		Port:        env("PORT", "8080"),
+		DatabaseURL: env("DATABASE_URL", "file:shop.db"),
+		JWTSecret:   os.Getenv("JWT_SECRET"),
+		SMTPHost:    env("SMTP_HOST", "localhost"),
+	}
+}
+-- internal/api/router.go --
+// Package api is the shop's HTTP API.
+package api
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/northwind/shop/internal/config"
+	"github.com/northwind/shop/internal/store"
+)
+
+// Server holds what the handlers need.
+type Server struct {
+	cfg   config.Config
+	store *store.Store
+}
+
+// New creates the API server.
+func New(cfg config.Config, st *store.Store) *Server {
+	return &Server{cfg: cfg, store: st}
+}
+
+// Router builds every route.
+func (s *Server) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.Logger, middleware.Recoverer)
+	r.Get("/healthz", s.handleHealth)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Post("/auth/login", s.handleLogin)
+		r.Post("/auth/register", s.handleRegister)
+
+		r.Get("/products", s.handleListProducts)
+		r.Get("/products/{id}", s.handleGetProduct)
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAuth)
+			r.Get("/me", s.handleMe)
+			r.Route("/orders", func(r chi.Router) {
+				r.Get("/", s.handleListOrders)
+				r.Post("/", s.handleCreateOrder)
+				r.Get("/{id}", s.handleGetOrder)
+				r.Post("/{id}/cancel", s.handleCancelOrder)
+			})
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAuth, s.requireAdmin)
+			r.Post("/products", s.handleCreateProduct)
+			r.Put("/products/{id}", s.handleUpdateProduct)
+			r.Delete("/products/{id}", s.handleDeleteProduct)
+		})
+	})
+	return r
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+-- internal/api/respond.go --
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func idParam(r *http.Request) int64 {
+	n, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	return n
+}
+-- internal/api/auth.go --
+package api
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+type ctxKey int
+
+const userKey ctxKey = 1
+
+// requireAuth checks the bearer token and puts the customer in the context.
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		c, err := s.parseToken(tok)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, "sign in first")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, c)))
+	})
+}
+
+// requireAdmin lets only shop staff through.
+func (s *Server) requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c := customer(r); c == nil || !c.Admin {
+			writeErr(w, http.StatusForbidden, "staff only")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func customer(r *http.Request) *store.Customer {
+	c, _ := r.Context().Value(userKey).(*store.Customer)
+	return c
+}
+
+func (s *Server) parseToken(tok string) (*store.Customer, error) {
+	t, err := jwt.Parse(tok, func(*jwt.Token) (any, error) { return []byte(s.cfg.JWTSecret), nil })
+	if err != nil {
+		return nil, err
+	}
+	sub, _ := t.Claims.GetSubject()
+	return s.store.CustomerByEmail(sub)
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	email := r.FormValue("email")
+	c, err := s.store.CustomerByEmail(email)
+	if err != nil || !c.CheckPassword(r.FormValue("password")) {
+		writeErr(w, http.StatusUnauthorized, "wrong email or password")
+		return
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": c.Email, "exp": time.Now().Add(24 * time.Hour).Unix()})
+	signed, _ := t.SignedString([]byte(s.cfg.JWTSecret))
+	writeJSON(w, http.StatusOK, map[string]string{"token": signed})
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	c, err := s.store.CreateCustomer(r.FormValue("email"), r.FormValue("name"), r.FormValue("password"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, customer(r))
+}
+-- internal/api/products.go --
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+func (s *Server) handleListProducts(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListProducts(r.URL.Query().Get("q"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleGetProduct(w http.ResponseWriter, r *http.Request) {
+	p, err := s.store.GetProduct(idParam(r))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such product")
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) handleCreateProduct(w http.ResponseWriter, r *http.Request) {
+	var p store.Product
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := s.store.SaveProduct(&p); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (s *Server) handleUpdateProduct(w http.ResponseWriter, r *http.Request) {
+	var p store.Product
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	p.ID = idParam(r)
+	if err := s.store.SaveProduct(&p); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) handleDeleteProduct(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteProduct(idParam(r)); err != nil {
+		writeErr(w, http.StatusNotFound, "no such product")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+-- internal/api/orders.go --
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/northwind/shop/internal/store"
+)
+
+func (s *Server) handleListOrders(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.OrdersOf(customer(r).ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Items []store.OrderItem `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || len(in.Items) == 0 {
+		writeErr(w, http.StatusBadRequest, "add something to the cart first")
+		return
+	}
+	o, err := s.store.CreateOrder(customer(r).ID, in.Items)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, o)
+}
+
+func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
+	o, err := s.store.GetOrder(customer(r).ID, idParam(r))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such order")
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+
+func (s *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
+	// TODO: refund through the payment provider once billing exists
+	if err := s.store.CancelOrder(customer(r).ID, idParam(r)); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+-- internal/store/store.go --
+// Package store keeps customers, products and orders in SQLite.
+package store
+
+import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"sort"
+
+	_ "modernc.org/sqlite"
+)
+
+// Store is the database.
+type Store struct {
+	db *sql.DB
+}
+
+// Open opens the database.
+func Open(url string) (*Store, error) {
+	db, err := sql.Open("sqlite", url)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+// Migrate applies the SQL files in migrations/.
+func (s *Store) Migrate() error {
+	files, err := filepath.Glob("migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(string(b)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+-- internal/store/customers.go --
+package store
+
+import "golang.org/x/crypto/bcrypt"
+
+// Customer is someone with an account.
+type Customer struct {
+	ID       int64  `json:"id"`
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Admin    bool   `json:"admin"`
+	password string
+}
+
+// CheckPassword compares a password with the stored hash.
+func (c *Customer) CheckPassword(p string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(c.password), []byte(p)) == nil
+}
+
+// CustomerByEmail finds a customer.
+func (s *Store) CustomerByEmail(email string) (*Customer, error) {
+	var c Customer
+	err := s.db.QueryRow(`SELECT id, email, name, admin, password_hash FROM customers WHERE email = ?`, email).Scan(&c.ID, &c.Email, &c.Name, &c.Admin, &c.password)
+	return &c, err
+}
+
+// CreateCustomer adds an account.
+func (s *Store) CreateCustomer(email, name, password string) (*Customer, error) {
+	h, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	res, err := s.db.Exec(`INSERT INTO customers (email, name, password_hash) VALUES (?, ?, ?)`, email, name, string(h))
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &Customer{ID: id, Email: email, Name: name}, nil
+}
+-- internal/store/products.go --
+package store
+
+// Product is something the shop sells.
+type Product struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	PriceCents  int64  `json:"price_cents"`
+	Stock       int    `json:"stock"`
+}
+
+// ListProducts returns the products matching q.
+func (s *Store) ListProducts(q string) ([]Product, error) {
+	rows, err := s.db.Query(`SELECT id, name, description, price_cents, stock FROM products WHERE name LIKE '%' || ? || '%' ORDER BY name`, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.PriceCents, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetProduct returns one product.
+func (s *Store) GetProduct(id int64) (*Product, error) {
+	var p Product
+	err := s.db.QueryRow(`SELECT id, name, description, price_cents, stock FROM products WHERE id = ?`, id).Scan(&p.ID, &p.Name, &p.Description, &p.PriceCents, &p.Stock)
+	return &p, err
+}
+
+// SaveProduct adds or updates a product.
+func (s *Store) SaveProduct(p *Product) error {
+	if p.ID == 0 {
+		res, err := s.db.Exec(`INSERT INTO products (name, description, price_cents, stock) VALUES (?, ?, ?, ?)`, p.Name, p.Description, p.PriceCents, p.Stock)
+		if err != nil {
+			return err
+		}
+		p.ID, _ = res.LastInsertId()
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE products SET name = ?, description = ?, price_cents = ?, stock = ? WHERE id = ?`, p.Name, p.Description, p.PriceCents, p.Stock, p.ID)
+	return err
+}
+
+// DeleteProduct removes a product.
+func (s *Store) DeleteProduct(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM products WHERE id = ?`, id)
+	return err
+}
+-- internal/store/orders.go --
+package store
+
+import "errors"
+
+// Order is a customer's purchase.
+type Order struct {
+	ID         int64       `json:"id"`
+	CustomerID int64       `json:"customer_id"`
+	Status     string      `json:"status"`
+	TotalCents int64       `json:"total_cents"`
+	Items      []OrderItem `json:"items"`
+}
+
+// OrderItem is one line of an order.
+type OrderItem struct {
+	ProductID int64 `json:"product_id"`
+	Quantity  int   `json:"quantity"`
+}
+
+// OrdersOf lists a customer's orders.
+func (s *Store) OrdersOf(customerID int64) ([]Order, error) {
+	rows, err := s.db.Query(`SELECT id, customer_id, status, total_cents FROM orders WHERE customer_id = ? ORDER BY id DESC`, customerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// CreateOrder places an order and lowers the stock.
+func (s *Store) CreateOrder(customerID int64, items []OrderItem) (*Order, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var total int64
+	for _, it := range items {
+		var price int64
+		var stock int
+		if err := tx.QueryRow(`SELECT price_cents, stock FROM products WHERE id = ?`, it.ProductID).Scan(&price, &stock); err != nil {
+			return nil, err
+		}
+		if stock < it.Quantity {
+			return nil, errors.New("not enough in stock")
+		}
+		total += price * int64(it.Quantity)
+	}
+	res, err := tx.Exec(`INSERT INTO orders (customer_id, status, total_cents) VALUES (?, 'new', ?)`, customerID, total)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	for _, it := range items {
+		if _, err := tx.Exec(`INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)`, id, it.ProductID, it.Quantity); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`UPDATE products SET stock = stock - ? WHERE id = ?`, it.Quantity, it.ProductID); err != nil {
+			return nil, err
+		}
+	}
+	return &Order{ID: id, CustomerID: customerID, Status: "new", TotalCents: total, Items: items}, tx.Commit()
+}
+
+// GetOrder returns one of the customer's orders.
+func (s *Store) GetOrder(customerID, id int64) (*Order, error) {
+	var o Order
+	err := s.db.QueryRow(`SELECT id, customer_id, status, total_cents FROM orders WHERE id = ? AND customer_id = ?`, id, customerID).Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents)
+	return &o, err
+}
+
+// CancelOrder cancels an order that has not shipped.
+func (s *Store) CancelOrder(customerID, id int64) error {
+	res, err := s.db.Exec(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND customer_id = ? AND status = 'new'`, id, customerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("this order can no longer be cancelled")
+	}
+	return nil
+}
+-- migrations/0001_init.sql --
+CREATE TABLE customers (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  email         TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL,
+  admin         INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE products (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price_cents INTEGER NOT NULL,
+  stock       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE orders (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  status      TEXT NOT NULL DEFAULT 'new',
+  total_cents INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE order_items (
+  order_id   INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id),
+  quantity   INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (order_id, product_id)
+);
+-- web/package.json --
+{
+  "name": "northwind-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.28.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0"
+  }
+}
+-- web/tsconfig.json --
+{
+  // the storefront
+  "compilerOptions": {
+    "target": "ES2020",
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] },
+  },
+  "include": ["src"]
+}
+-- web/src/main.tsx --
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import App from './App'
+
+const queryClient = new QueryClient()
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter><App /></BrowserRouter>
+    </QueryClientProvider>
+  </React.StrictMode>,
+)
+-- web/src/App.tsx --
+import { Route, Routes } from 'react-router-dom'
+import { Header } from '@/components/Header'
+import Products from '@/pages/Products'
+import Cart from '@/pages/Cart'
+import Orders from '@/pages/Orders'
+
+export default function App() {
+  return (
+    <>
+      <Header />
+      <Routes>
+        <Route path="/" element={<Products />} />
+        <Route path="/cart" element={<Cart />} />
+        <Route path="/orders" element={<Orders />} />
+      </Routes>
+    </>
+  )
+}
+-- web/src/api/client.ts --
+// Talks to the shop API.
+export interface Product { id: number; name: string; description: string; price_cents: number; stock: number }
+export interface OrderItem { product_id: number; quantity: number }
+export interface Order { id: number; status: string; total_cents: number; items: OrderItem[] }
+
+const BASE = import.meta.env.VITE_API_URL || '/api/v1'
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error((await res.json()).error || res.statusText)
+  return res.status === 204 ? (undefined as T) : res.json()
+}
+
+export const listProducts = (q = '') => request<Product[]>('GET', `/products?q=${encodeURIComponent(q)}`)
+export const getProduct = (id: number) => request<Product>('GET', `/products/${id}`)
+export const listOrders = () => request<Order[]>('GET', '/orders')
+export const createOrder = (items: OrderItem[]) => request<Order>('POST', '/orders', { items })
+export const cancelOrder = (id: number) => request<void>('POST', `/orders/${id}/cancel`)
+-- web/src/hooks/useCart.ts --
+import { useState } from 'react'
+import type { OrderItem } from '@/api/client'
+
+export function useCart() {
+  const [items, setItems] = useState<OrderItem[]>(() => JSON.parse(localStorage.getItem('cart') || '[]'))
+  const save = (next: OrderItem[]) => { setItems(next); localStorage.setItem('cart', JSON.stringify(next)) }
+  const add = (productId: number) => {
+    const found = items.find(i => i.product_id === productId)
+    save(found ? items.map(i => i === found ? { ...i, quantity: i.quantity + 1 } : i) : [...items, { product_id: productId, quantity: 1 }])
+  }
+  const clear = () => save([])
+  return { items, add, clear }
+}
+-- web/src/components/Header.tsx --
+import { Link } from 'react-router-dom'
+import { useCart } from '@/hooks/useCart'
+
+export function Header() {
+  const { items } = useCart()
+  return (
+    <header className="header">
+      <Link to="/">Northwind</Link>
+      <nav><Link to="/orders">Orders</Link> <Link to="/cart">Cart ({items.length})</Link></nav>
+    </header>
+  )
+}
+-- web/src/components/ProductCard.tsx --
+import type { Product } from '@/api/client'
+import { formatPrice } from '@/lib/money'
+
+export function ProductCard({ product, onAdd }: { product: Product; onAdd: () => void }) {
+  return (
+    <article className="card">
+      <h3>{product.name}</h3>
+      <p>{product.description}</p>
+      <strong>{formatPrice(product.price_cents)}</strong>
+      <button disabled={product.stock === 0} onClick={onAdd}>{product.stock === 0 ? 'Sold out' : 'Add to cart'}</button>
+    </article>
+  )
+}
+-- web/src/lib/money.ts --
+export function formatPrice(cents: number, currency = 'EUR') {
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(cents / 100)
+}
+-- web/src/pages/Products.tsx --
+import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { listProducts } from '@/api/client'
+import { ProductCard } from '@/components/ProductCard'
+import { useCart } from '@/hooks/useCart'
+
+export default function Products() {
+  const [q, setQ] = useState('')
+  const { data = [] } = useQuery({ queryKey: ['products', q], queryFn: () => listProducts(q) })
+  const cart = useCart()
+  return (
+    <main>
+      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search" />
+      <div className="grid">{data.map(p => <ProductCard key={p.id} product={p} onAdd={() => cart.add(p.id)} />)}</div>
+    </main>
+  )
+}
+-- web/src/pages/Cart.tsx --
+import { useNavigate } from 'react-router-dom'
+import { createOrder } from '@/api/client'
+import { useCart } from '@/hooks/useCart'
+
+export default function Cart() {
+  const cart = useCart()
+  const navigate = useNavigate()
+  const checkout = async () => { await createOrder(cart.items); cart.clear(); navigate('/orders') }
+  return (
+    <main>
+      <h1>Your cart</h1>
+      <ul>{cart.items.map(i => <li key={i.product_id}>#{i.product_id} × {i.quantity}</li>)}</ul>
+      <button disabled={cart.items.length === 0} onClick={checkout}>Check out</button>
+    </main>
+  )
+}
+-- web/src/pages/Orders.tsx --
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { cancelOrder, listOrders } from '@/api/client'
+import { formatPrice } from '@/lib/money'
+
+export default function Orders() {
+  const qc = useQueryClient()
+  const { data = [] } = useQuery({ queryKey: ['orders'], queryFn: listOrders })
+  const cancel = async (id: number) => { await cancelOrder(id); qc.invalidateQueries({ queryKey: ['orders'] }) }
+  return (
+    <main>
+      <h1>Orders</h1>
+      {data.map(o => (
+        <div key={o.id} className="order">
+          #{o.id} · {o.status} · {formatPrice(o.total_cents)}
+          {o.status === 'new' && <button onClick={() => cancel(o.id)}>Cancel</button>}
+        </div>
+      ))}
+    </main>
+  )
+}

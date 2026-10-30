@@ -1,0 +1,10 @@
+[project]
+name = "pyproj"
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic==2.6.0",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
