@@ -64,7 +64,7 @@ function Shell() {
 
   const current = loc.pathname.match(/^\/c\/(\d+)/)?.[1]
   const rescan = async () => {
-    if (!current) return
+    if (!current || codebases?.find(c => c.id === Number(current))?.role === 'view') return
     await api.post(`${V1}/codebases/${current}/scan`).catch(() => {})
     reload()
   }

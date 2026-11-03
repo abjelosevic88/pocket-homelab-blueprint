@@ -100,7 +100,7 @@ export default function Scans() {
               </span>
               {s.status === 'done' && s.id !== scanId && <button type="button" className="btn sm" onClick={() => navigate(`/c/${c.id}?scan=${s.id}`)}>Look at it</button>}
               {s.id === scanId && <span className="badge accent-soft">shown</span>}
-              {s.status !== 'running' && s.status !== 'queued' && <button type="button" className="btn sm ghost icon-only" aria-label="Delete scan" title="Delete" onClick={() => setDel(s)}><Icon name="trash" size={14} /></button>}
+              {c.role === 'owner' && s.status !== 'running' && s.status !== 'queued' && <button type="button" className="btn sm ghost icon-only" aria-label="Delete scan" title="Delete" onClick={() => setDel(s)}><Icon name="trash" size={14} /></button>}
             </li>
           )
         })}</ul>

@@ -45,6 +45,35 @@ type Codebase struct {
 	// Filled in for lists: the latest scan (any status) and the latest finished one.
 	Latest *Scan `json:"latest,omitempty"`
 	Done   *Scan `json:"done,omitempty"`
+
+	// How the person asking may use it: "owner", or the role it is shared
+	// with them in (then Owner is whose it is); Shares is with how many
+	// people the owner shares it.
+	Role   string `json:"role"`
+	Owner  string `json:"owner,omitempty"`
+	Shares int    `json:"shares"`
+}
+
+// Share roles.
+const (
+	ShareView = "view" // read every scan, keep one's own notes, ask the AI
+	ShareScan = "scan" // also scan it again
+)
+
+// Share is one person a codebase is shared with.
+type Share struct {
+	UserID    int64  `json:"user_id"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	Role      string `json:"role"`
+	CreatedAt string `json:"created_at"`
+}
+
+// Person is someone on this box one may share with.
+type Person struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
 }
 
 // Scan is one reading of a codebase. The result itself is loaded separately.

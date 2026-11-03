@@ -214,7 +214,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = decode(r, &in)
 	p := strings.Trim(in.Path, "/")
-	c, err := s.store.GetCodebase(ctx, uid, sc.CodebaseID)
+	c, err := s.codebaseFor(ctx, sc.CodebaseID)
 	if err != nil {
 		s.fail(w, err, "codebase")
 		return
@@ -259,7 +259,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "question is required")
 		return
 	}
-	c, err := s.store.GetCodebase(ctx, uid, sc.CodebaseID)
+	c, err := s.codebaseFor(ctx, sc.CodebaseID)
 	if err != nil {
 		s.fail(w, err, "codebase")
 		return

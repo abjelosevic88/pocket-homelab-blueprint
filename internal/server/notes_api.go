@@ -14,7 +14,7 @@ func (s *Server) handleListNotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	uid := actorID(ctx)
 	cid := idParam(r, "id")
-	if _, err := s.store.GetCodebase(ctx, uid, cid); err != nil {
+	if _, err := s.codebaseFor(ctx, cid); err != nil {
 		s.fail(w, err, "codebase")
 		return
 	}
@@ -31,7 +31,7 @@ func (s *Server) handleCreateNote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	uid := actorID(ctx)
 	cid := idParam(r, "id")
-	if _, err := s.store.GetCodebase(ctx, uid, cid); err != nil {
+	if _, err := s.codebaseFor(ctx, cid); err != nil {
 		s.fail(w, err, "codebase")
 		return
 	}
@@ -93,14 +93,13 @@ type searchHit struct {
 // person's codebases: files, symbols, endpoints, tables and env variables.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	uid := actorID(ctx)
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	if len(q) < 2 {
 		writeJSON(w, http.StatusOK, []searchHit{})
 		return
 	}
 	only := idOrZero(r.URL.Query().Get("codebase"))
-	list, err := s.store.ListCodebases(ctx, uid)
+	list, err := s.listCodebases(ctx)
 	if err != nil {
 		s.fail(w, err, "search")
 		return
@@ -126,7 +125,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if c.Done == nil || (only > 0 && c.ID != only) {
 			continue
 		}
-		res, err := s.result(ctx, uid, c.Done.ID)
+		res, err := s.result(ctx, c.UserID, c.Done.ID)
 		if err != nil {
 			continue
 		}

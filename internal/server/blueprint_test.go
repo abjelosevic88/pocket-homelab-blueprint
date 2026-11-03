@@ -371,6 +371,80 @@ func TestPerPersonIsolation(t *testing.T) {
 	}
 }
 
+// Sharing: Alice shares a codebase with Bob to look at; he reads every scan
+// and keeps his own notes, but cannot change, delete, share or scan it until
+// she lets him scan; then she stops sharing and it is gone for him.
+func TestSharing(t *testing.T) {
+	a := newApp(t, nil)
+	_, c := a.upload(a.alice, zipOf(t, sampleV1), "Alice's shop", 0)
+	cid := int64(c["id"].(float64))
+	sid := a.waitScan(a.alice, cid)
+	a.ok(a.alice, "POST", fmt.Sprintf("/api/v1/codebases/%d/notes", cid), map[string]any{"path": "store", "text": "alice's"})
+	bob, alice := a.ids["Bob"], a.ids["Alice"]
+
+	_, _, people := a.call(a.alice, "GET", "/api/v1/people", nil)
+	if len(people) != 1 || people[0].(map[string]any)["email"] != "bob@example.com" {
+		t.Fatalf("people = %v", people)
+	}
+	a.expect(400, a.alice, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), map[string]any{"role": "edit"})
+	a.expect(400, a.alice, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, alice), map[string]any{"role": "view"})
+	a.expect(404, a.bob, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), map[string]any{"role": "view"})
+	a.ok(a.alice, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), map[string]any{"role": "view"})
+
+	_, _, shares := a.call(a.alice, "GET", fmt.Sprintf("/api/v1/codebases/%d/shares", cid), nil)
+	if len(shares) != 1 || shares[0].(map[string]any)["role"] != "view" {
+		t.Fatalf("shares = %v", shares)
+	}
+	_, _, list := a.call(a.bob, "GET", "/api/v1/codebases", nil)
+	if len(list) != 1 {
+		t.Fatalf("bob's list = %v", list)
+	}
+	if got := list[0].(map[string]any); got["role"] != "view" || got["owner"] != "Alice" || got["done"] == nil {
+		t.Fatalf("shared codebase = %v", got)
+	}
+	for _, p := range []string{
+		fmt.Sprintf("/api/v1/codebases/%d", cid), fmt.Sprintf("/api/v1/codebases/%d/scans", cid),
+		fmt.Sprintf("/api/v1/scans/%d", sid), fmt.Sprintf("/api/v1/scans/%d/overview", sid), fmt.Sprintf("/api/v1/scans/%d/tree", sid),
+		fmt.Sprintf("/api/v1/scans/%d/file?path=store", sid), fmt.Sprintf("/api/v1/scans/%d/graph", sid),
+		fmt.Sprintf("/api/v1/scans/%d/openapi.json", sid), fmt.Sprintf("/api/v1/scans/%d/report.md", sid),
+	} {
+		a.expect(200, a.bob, "GET", p, nil)
+	}
+	_, _, hits := a.call(a.bob, "GET", "/api/v1/search?q=Items", nil)
+	if len(hits) == 0 {
+		t.Fatal("bob's search does not find the shared code")
+	}
+	// notes stay personal
+	a.ok(a.bob, "POST", fmt.Sprintf("/api/v1/codebases/%d/notes", cid), map[string]any{"path": "store", "text": "bob's"})
+	_, _, notes := a.call(a.bob, "GET", fmt.Sprintf("/api/v1/codebases/%d/notes", cid), nil)
+	if len(notes) != 1 || notes[0].(map[string]any)["text"] != "bob's" {
+		t.Fatalf("bob's notes = %v", notes)
+	}
+	// owner-only things
+	a.expect(404, a.bob, "PUT", fmt.Sprintf("/api/v1/codebases/%d", cid), map[string]any{"name": "taken"})
+	a.expect(404, a.bob, "DELETE", fmt.Sprintf("/api/v1/codebases/%d", cid), nil)
+	a.expect(404, a.bob, "DELETE", fmt.Sprintf("/api/v1/scans/%d", sid), nil)
+	a.expect(404, a.bob, "GET", fmt.Sprintf("/api/v1/codebases/%d/shares", cid), nil)
+	a.expect(403, a.bob, "POST", fmt.Sprintf("/api/v1/codebases/%d/scan", cid), nil)
+
+	// allowed to scan: the scan is Alice's
+	a.ok(a.alice, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), map[string]any{"role": "scan"})
+	a.ok(a.bob, "POST", fmt.Sprintf("/api/v1/codebases/%d/scan", cid), nil)
+	if sid2 := a.waitScan(a.alice, cid); sid2 == sid {
+		t.Fatal("bob's scan did not run")
+	}
+
+	// Bob leaves; Alice shares again and stops sharing
+	a.ok(a.bob, "DELETE", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), nil)
+	a.expect(404, a.bob, "GET", fmt.Sprintf("/api/v1/codebases/%d", cid), nil)
+	a.ok(a.alice, "PUT", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), map[string]any{"role": "view"})
+	a.ok(a.alice, "DELETE", fmt.Sprintf("/api/v1/codebases/%d/shares/%d", cid, bob), nil)
+	a.expect(404, a.bob, "GET", fmt.Sprintf("/api/v1/scans/%d/overview", sid), nil)
+	if _, _, list := a.call(a.bob, "GET", "/api/v1/codebases", nil); len(list) != 0 {
+		t.Fatalf("bob still sees %v", list)
+	}
+}
+
 // Server folders: only admins, and only inside SOURCE_ROOTS.
 func TestServerFoldersAdminOnly(t *testing.T) {
 	root := t.TempDir()

@@ -16,11 +16,11 @@ import (
 
 // ---- reading a scan ----
 
-// scanFor loads the scan in the URL with its result (the person's own only).
+// scanFor loads the scan in the URL with its result (the person's own, or
+// of a codebase shared with them).
 func (s *Server) scanFor(w http.ResponseWriter, r *http.Request) (*store.Scan, *analyze.Result, bool) {
 	ctx := r.Context()
-	uid := actorID(ctx)
-	sc, err := s.store.GetScan(ctx, uid, idParam(r, "id"))
+	sc, c, err := s.scanAccess(ctx, idParam(r, "id"))
 	if err != nil {
 		s.fail(w, err, "scan")
 		return nil, nil, false
@@ -29,7 +29,7 @@ func (s *Server) scanFor(w http.ResponseWriter, r *http.Request) (*store.Scan, *
 		writeErr(w, http.StatusConflict, "this scan has not finished")
 		return nil, nil, false
 	}
-	res, err := s.result(ctx, uid, sc.ID)
+	res, err := s.result(ctx, c.UserID, sc.ID)
 	if err != nil {
 		s.fail(w, err, "scan result")
 		return nil, nil, false
@@ -38,7 +38,7 @@ func (s *Server) scanFor(w http.ResponseWriter, r *http.Request) (*store.Scan, *
 }
 
 func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
-	sc, err := s.store.GetScan(r.Context(), actorID(r.Context()), idParam(r, "id"))
+	sc, _, err := s.scanAccess(r.Context(), idParam(r, "id"))
 	if err != nil {
 		s.fail(w, err, "scan")
 		return
@@ -356,7 +356,7 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	c, err := s.store.GetCodebase(ctx, actorID(ctx), sc.CodebaseID)
+	c, err := s.codebaseFor(ctx, sc.CodebaseID)
 	if err != nil {
 		s.fail(w, err, "codebase")
 		return

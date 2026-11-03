@@ -27,16 +27,16 @@ export function Sidebar({ onNavigate, onAdd }: { onNavigate: () => void; onAdd: 
         </NavLink>
       </nav>
 
-      {!!codebases?.length && (
-        <section className="sb-sec">
-          <h4 className="sb-h"><span className="sb-h-btn">Codebases</span></h4>
+      {[{ title: 'Codebases', list: codebases?.filter(c => c.role === 'owner') }, { title: 'Shared with me', list: codebases?.filter(c => c.role !== 'owner') }].map(sec => !!sec.list?.length && (
+        <section className="sb-sec" key={sec.title}>
+          <h4 className="sb-h"><span className="sb-h-btn">{sec.title}</span></h4>
           <ul className="sb-cbs">
-            {codebases.map(c => {
+            {sec.list.map(c => {
               const busy = isBusy(c)
               const failed = c.latest?.status === 'failed'
               return (
                 <li key={c.id}>
-                  <NavLink to={`/c/${c.id}`} onClick={onNavigate} className={({ isActive }) => `sb-cb ${isActive ? 'active' : ''}`} title={c.name}>
+                  <NavLink to={`/c/${c.id}`} onClick={onNavigate} className={({ isActive }) => `sb-cb ${isActive ? 'active' : ''}`} title={c.owner ? `${c.name} · shared by ${c.owner}` : c.name}>
                     <Icon name={SOURCE_ICON[c.source] || 'folder'} size={14} className="muted" />
                     <span className="grow ellipsis">{c.name}</span>
                     {busy ? <span className="sb-prog tnum" title={c.latest?.stage}>{c.latest?.status === 'queued' ? '…' : `${c.latest?.progress || 0}%`}</span>
@@ -48,7 +48,7 @@ export function Sidebar({ onNavigate, onAdd }: { onNavigate: () => void; onAdd: 
             })}
           </ul>
         </section>
-      )}
+      ))}
       {codebases && codebases.length === 0 && <p className="muted small sb-hint">Add a git repository, an archive{settings?.core_configured ? ', a folder from Pocket Files' : ''} or a folder on this server to see how it is built.</p>}
 
       <div className="sb-foot">

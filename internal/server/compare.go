@@ -42,13 +42,12 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	uid := actorID(ctx)
-	scA, err := s.store.GetScan(ctx, uid, idParam(r, "other"))
+	scA, c, err := s.scanAccess(ctx, idParam(r, "other"))
 	if err != nil || scA.CodebaseID != scB.CodebaseID {
 		writeErr(w, http.StatusNotFound, "pick another scan of the same codebase")
 		return
 	}
-	a, err := s.result(ctx, uid, scA.ID)
+	a, err := s.result(ctx, c.UserID, scA.ID)
 	if err != nil {
 		s.fail(w, err, "scan result")
 		return

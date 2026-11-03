@@ -9,6 +9,9 @@ import (
 
 const codebaseCols = `id, user_id, name, description, source, location, branch, subdir, git_user, git_token, vendored, rescan_hours, pinned, last_scan_id, created_at, updated_at`
 
+// codebaseColsC is codebaseCols for a query where codebases is "c".
+var codebaseColsC = "c." + strings.ReplaceAll(codebaseCols, ", ", ", c.")
+
 func scanCodebase(row interface{ Scan(...any) error }) (*Codebase, error) {
 	var c Codebase
 	var vendored, pinned int
@@ -24,34 +27,72 @@ func scanCodebase(row interface{ Scan(...any) error }) (*Codebase, error) {
 	return &c, nil
 }
 
-// ListCodebases returns one person's codebases, pinned first, with their
-// latest scan and latest finished scan.
+// ListCodebases returns one person's codebases, pinned first, then those
+// others share with them, with their latest scan and latest finished scan.
 func (s *Store) ListCodebases(ctx context.Context, uid int64) ([]Codebase, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+codebaseCols+` FROM codebases WHERE user_id = ? ORDER BY pinned DESC, name COLLATE NOCASE`, uid)
+	out, err := s.queryCodebases(ctx, `SELECT `+codebaseCols+`, 'owner', '', (SELECT COUNT(1) FROM shares WHERE codebase_id = c.id)
+		FROM codebases c WHERE user_id = ? ORDER BY pinned DESC, name COLLATE NOCASE`, uid)
 	if err != nil {
 		return nil, err
 	}
-	var out []Codebase
-	for rows.Next() {
-		c, err := scanCodebase(rows)
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		out = append(out, *c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	shared, err := s.queryCodebases(ctx, `SELECT `+codebaseColsC+`, sh.role, (SELECT COALESCE(NULLIF(u.name, ''), u.email) FROM users u WHERE u.id = c.user_id), 0
+		FROM codebases c JOIN shares sh ON sh.codebase_id = c.id WHERE sh.user_id = ? ORDER BY c.name COLLATE NOCASE`, uid)
+	if err != nil {
 		return nil, err
 	}
+	out = append(out, shared...)
 	for i := range out {
-		out[i].Latest, out[i].Done = s.latestScans(ctx, uid, out[i].ID)
+		out[i].Latest, out[i].Done = s.latestScans(ctx, out[i].UserID, out[i].ID)
+		out[i].Pinned = out[i].Pinned && out[i].Role == "owner" // pinning is the owner's
 	}
 	if out == nil {
 		out = []Codebase{}
 	}
 	return out, nil
 }
+
+// OwnCodebases returns only the person's own codebases (for export).
+func (s *Store) OwnCodebases(ctx context.Context, uid int64) ([]Codebase, error) {
+	list, err := s.ListCodebases(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	own := list[:0]
+	for _, c := range list {
+		if c.Role == "owner" {
+			own = append(own, c)
+		}
+	}
+	return own, nil
+}
+
+func (s *Store) queryCodebases(ctx context.Context, q string, args ...any) ([]Codebase, error) {
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Codebase
+	for rows.Next() {
+		var role, owner string
+		var shares int
+		c, err := scanCodebase(extraScan{rows, []any{&role, &owner, &shares}})
+		if err != nil {
+			return nil, err
+		}
+		c.Role, c.Owner, c.Shares = role, owner, shares
+		out = append(out, *c)
+	}
+	return out, rows.Err()
+}
+
+// extraScan lets scanCodebase read a row with more columns after its own.
+type extraScan struct {
+	row   interface{ Scan(...any) error }
+	extra []any
+}
+
+func (e extraScan) Scan(dest ...any) error { return e.row.Scan(append(dest, e.extra...)...) }
 
 func (s *Store) latestScans(ctx context.Context, uid, cid int64) (latest, done *Scan) {
 	latest, _ = scanScan(s.DB.QueryRowContext(ctx, `SELECT `+scanCols+` FROM scans WHERE user_id = ? AND codebase_id = ? ORDER BY id DESC LIMIT 1`, uid, cid))
@@ -66,6 +107,29 @@ func (s *Store) GetCodebase(ctx context.Context, uid, id int64) (*Codebase, erro
 		return nil, notFound(err)
 	}
 	c.Latest, c.Done = s.latestScans(ctx, uid, c.ID)
+	c.Role, c.Shares = "owner", s.CountShares(ctx, c.ID)
+	return c, nil
+}
+
+// SharedCodebase returns a codebase the person owns or that is shared with
+// them; Role tells which. ErrNotFound when it is neither.
+func (s *Store) SharedCodebase(ctx context.Context, uid, id int64) (*Codebase, error) {
+	var role, owner string
+	c, err := scanCodebase(extraScan{s.DB.QueryRowContext(ctx, `SELECT `+codebaseCols+`,
+		CASE WHEN c.user_id = ? THEN 'owner' ELSE (SELECT role FROM shares WHERE codebase_id = c.id AND user_id = ?) END,
+		(SELECT COALESCE(NULLIF(u.name, ''), u.email) FROM users u WHERE u.id = c.user_id)
+		FROM codebases c WHERE id = ? AND (c.user_id = ? OR EXISTS (SELECT 1 FROM shares WHERE codebase_id = c.id AND user_id = ?))`,
+		uid, uid, id, uid, uid), []any{&role, &owner}})
+	if err != nil {
+		return nil, notFound(err)
+	}
+	c.Role = role
+	c.Latest, c.Done = s.latestScans(ctx, c.UserID, c.ID)
+	if role == "owner" {
+		c.Shares = s.CountShares(ctx, c.ID)
+	} else {
+		c.Owner, c.Pinned = owner, false
+	}
 	return c, nil
 }
 

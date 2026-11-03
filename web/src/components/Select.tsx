@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { type CSSProperties, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Icon } from './icons'
 
 export interface SelectOption { value: string; label: string; hint?: string; group?: string; /** shown, not pickable */ disabled?: boolean }
@@ -27,6 +27,7 @@ export function Select({ value, onChange, options, placeholder = 'Choose…', on
   const [hl, setHl] = useState(0)
   const [busy, setBusy] = useState(false)
   const [up, setUp] = useState(false)
+  const [float, setFloat] = useState<CSSProperties | null>(null) // in a dialog: placed on the page, not cut off by it
   const root = useRef<HTMLDivElement>(null)
   const list = useRef<HTMLDivElement>(null)
   const search = useRef<HTMLInputElement>(null)
@@ -57,8 +58,23 @@ export function Select({ value, onChange, options, placeholder = 'Choose…', on
   useEffect(() => { setHl(0) }, [q])
   useLayoutEffect(() => {
     if (!open || !root.current) return
-    const r = root.current.getBoundingClientRect()
-    setUp(window.innerHeight - r.bottom < 300 && r.top > 300)
+    const el = root.current
+    const place = () => {
+      const r = el.getBoundingClientRect()
+      const below = window.innerHeight - r.bottom, above = r.top
+      const goUp = below < 300 && above > below
+      setUp(goUp)
+      // a dialog scrolls and clips what is in it: there the list is fixed to the page, next to the field
+      setFloat(el.closest('.modal') ? {
+        position: 'fixed', left: r.left, width: Math.max(r.width, 220), minWidth: 0,
+        ...(goUp ? { top: 'auto', bottom: window.innerHeight - r.top + 4, maxHeight: above - 12 } : { top: r.bottom + 4, bottom: 'auto', maxHeight: below - 12 }),
+      } : null)
+    }
+    place()
+    if (!el.closest('.modal')) return
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => { window.removeEventListener('resize', place); window.removeEventListener('scroll', place, true) }
   }, [open])
   useEffect(() => {
     const el = list.current?.querySelector<HTMLElement>(`[data-i="${hl}"]`)
@@ -91,7 +107,7 @@ export function Select({ value, onChange, options, placeholder = 'Choose…', on
         <Chevron />
       </button>
       {open && (
-        <div className={`sel-pop ${up ? 'up' : ''}`}>
+        <div className={`sel-pop ${up ? 'up' : ''} ${float ? 'float' : ''}`} style={float || undefined}>
           <div className="sel-search"><Icon name="search" size={14} /><input ref={search} value={q} onChange={e => setQ(e.target.value)} placeholder="Type to filter…" aria-label="Filter options" autoComplete="off" /></div>
           <div className="sel-list" role="listbox" id={id} ref={list}>
             {rows.length === 0 && <div className="sel-empty muted">No matches</div>}

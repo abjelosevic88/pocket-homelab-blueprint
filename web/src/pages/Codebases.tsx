@@ -36,6 +36,8 @@ function Card({ c, reload }: { c: Codebase; reload: () => void }) {
           <span className="cb-where ellipsis small muted" title={SOURCE_LABEL[c.source]}>{where(c)}</span>
         </span>
         {c.pinned && <Icon name="pin" size={13} className="faint" />}
+        {c.role !== 'owner' ? <Icon name="users" size={13} className="faint" title={`Shared by ${c.owner}`} />
+          : c.shares > 0 && <Icon name="users" size={13} className="faint" title={`Shared with ${c.shares}`} />}
       </div>
       {s ? <>
         <div className="cb-nums">
@@ -47,7 +49,7 @@ function Card({ c, reload }: { c: Codebase; reload: () => void }) {
         {langs ? <LangBar langs={langs} /> : <div className="stacked" style={{ height: 8 }} />}
       </> : !busy && <p className="muted small">{c.latest?.status === 'failed' ? 'The scan failed — open it to see why.' : 'Not scanned yet.'}</p>}
       <div className="cb-foot small muted">
-        {busy && c.latest ? <ScanProgress scan={c.latest} onCancel={reload} />
+        {busy && c.latest ? <ScanProgress scan={c.latest} onCancel={c.role !== 'view' ? reload : undefined} />
           : <>
             {c.latest?.status === 'failed' ? <span className="bad row"><Icon name="alert" size={13} />Last scan failed</span> : c.done ? <span>Scanned {ago(c.done.finished_at)}</span> : <span />}
             {!!s?.cycles && <span className="cb-warn" title="Folders that import each other"><Icon name="loop" size={13} />{s.cycles} {s.cycles === 1 ? 'loop' : 'loops'}</span>}

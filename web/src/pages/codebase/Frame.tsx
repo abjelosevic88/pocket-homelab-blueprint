@@ -3,7 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import { NavLink, Outlet, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, uploadForm, V1 } from '../../lib/api'
 import { useData, isBusy } from '../../lib/data'
-import { SOURCE_ICON, SOURCE_LABEL, where } from '../../lib/code'
+import { mayScan, SOURCE_ICON, SOURCE_LABEL, where } from '../../lib/code'
 import { ago, fmtDateTime } from '../../lib/format'
 import type { Codebase, Scan } from '../../lib/types'
 import { Icon } from '../../components/icons'
@@ -13,6 +13,7 @@ import { SwitchLine } from '../../components/SwitchLine'
 import { useCrumb } from '../../components/Layout'
 import { ScanFailed, ScanProgress } from '../../components/ScanState'
 import { RESCAN_OPTIONS } from '../../components/AddCodebase'
+import { ShareDialog } from '../../components/ShareDialog'
 import { PathPanel } from './PathPanel'
 import { SourceView } from './SourceView'
 
@@ -58,6 +59,8 @@ export default function Frame() {
   useCrumb(c?.name)
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [sharing, setSharing] = useState(false)
+  const [leaving, setLeaving] = useState(false)
   const [viewing, setViewing] = useState<Scan | null>(null)
 
   const pick = sp.get('scan')
@@ -88,15 +91,20 @@ export default function Frame() {
     try { await api.post(`${V1}/codebases/${c.id}/scan`); reload() } catch (e) { toast(errMsg(e), 'err') }
   }
   const qs = (extra = '') => { const n = new URLSearchParams(); if (pick) n.set('scan', pick); const s = n.toString(); return s ? `?${s}${extra}` : extra ? `?${extra.slice(1)}` : '' }
+  const own = c.role === 'owner'
   const menu = (): MenuItem[] => [
-    { label: 'Edit', icon: 'edit', onSelect: () => setEditing(true) },
-    { label: c.pinned ? 'Unpin' : 'Pin to the top', icon: 'pin', onSelect: async () => { await api.put(`${V1}/codebases/${c.id}`, { pinned: !c.pinned }); reload() } },
+    ...(own ? [
+      { label: 'Edit', icon: 'edit', onSelect: () => setEditing(true) },
+      { label: c.shares ? `Share (${c.shares})` : 'Share', icon: 'users', onSelect: () => setSharing(true) },
+      { label: c.pinned ? 'Unpin' : 'Pin to the top', icon: 'pin', onSelect: async () => { await api.put(`${V1}/codebases/${c.id}`, { pinned: !c.pinned }); reload() } },
+    ] : [{ heading: `Shared by ${c.owner} · ${c.role === 'scan' ? 'you can scan it' : 'you can view it'}` }]),
     ...(scanId ? ['sep' as const,
       { label: 'Download report (Markdown)', icon: 'download', onSelect: () => download(`${V1}/scans/${scanId}/report.md?download=1`) },
       { label: 'Download OpenAPI (YAML)', icon: 'download', onSelect: () => download(`${V1}/scans/${scanId}/openapi.yaml?download=1`) },
       { label: 'Download everything found (JSON)', icon: 'download', onSelect: () => download(`${V1}/scans/${scanId}/export.json`) }] : []),
     'sep',
-    { label: 'Delete codebase', icon: 'trash', danger: true, onSelect: () => setDeleting(true) },
+    own ? { label: 'Delete codebase', icon: 'trash', danger: true, onSelect: () => setDeleting(true) }
+      : { label: 'Remove from my codebases', icon: 'x', danger: true, onSelect: () => setLeaving(true) },
   ]
   return (
     <Ctx.Provider value={state}>
@@ -107,17 +115,20 @@ export default function Frame() {
             <h1 className="cb-title ellipsis">{c.name}</h1>
             <div className="small muted row wrap">
               <span title={SOURCE_LABEL[c.source]} className="mono ellipsis cb-loc">{where(c)}</span>
+              {!own && <span className="cb-shared" title={c.role === 'scan' ? 'Shared with you: you can look at it and scan it again' : 'Shared with you: you can look at it'}>· <Icon name="users" size={12} />shared by {c.owner}</span>}
+              {own && c.shares > 0 && <span className="cb-shared">· <button type="button" className="cb-shared-btn" onClick={() => setSharing(true)} title="Who it is shared with"><Icon name="users" size={12} />shared with {c.shares === 1 ? '1 person' : `${c.shares} people`}</button></span>}
               {c.done && <span>· scanned {ago(c.done.finished_at)}{c.done.commit && <> at <span className="mono">{c.done.commit}</span></>}</span>}
               {c.rescan_hours > 0 && <span title="Scans again on its own">· <Icon name="repeat" size={12} /> every {c.rescan_hours >= 24 ? `${c.rescan_hours / 24} day${c.rescan_hours > 24 ? 's' : ''}` : `${c.rescan_hours} h`}</span>}
             </div>
           </div>
           <div className="row">
-            <button type="button" className="btn" onClick={rescan} disabled={busy} title="Scan again (r)">{busy ? <Spinner /> : <Icon name="refresh" size={15} />}<span className="hide-sm">Scan again</span></button>
+            {own && <button type="button" className="btn" onClick={() => setSharing(true)} title="Share with others on this box"><Icon name="users" size={15} /><span className="hide-sm">Share</span></button>}
+            {mayScan(c) && <button type="button" className="btn" onClick={rescan} disabled={busy} title="Scan again (r)">{busy ? <Spinner /> : <Icon name="refresh" size={15} />}<span className="hide-sm">Scan again</span></button>}
             <MenuButton label="More" items={menu} align="right"><Icon name="more" size={18} /></MenuButton>
           </div>
         </header>
         {c.description && <p className="muted cb-desc">{c.description}</p>}
-        {busy && c.latest && <ScanProgress scan={c.latest} onCancel={reload} />}
+        {busy && c.latest && <ScanProgress scan={c.latest} onCancel={mayScan(c) ? reload : undefined} />}
         {!busy && failedNewer && c.latest && <ScanFailed scan={c.latest} />}
         {pick && viewing && c.done && viewing.id !== c.done.id && (
           <div className="callout"><Icon name="clock" size={16} /><span className="grow">You are looking at the scan from {fmtDateTime(viewing.finished_at)}.</span>
@@ -127,11 +138,14 @@ export default function Frame() {
           {TABS.map(t => <NavLink key={t.to} to={`/c/${c.id}${t.to ? '/' + t.to : ''}${qs()}`} end={t.to === ''} className={({ isActive }) => isActive ? 'active' : ''}><Icon name={t.icon} size={15} />{t.label}</NavLink>)}
         </nav>
         {scanId ? <Outlet /> : busy ? <div className="empty"><h3>Scanning for the first time…</h3><p className="muted">The results show up here as soon as the scan is done.</p></div>
-          : <div className="empty"><h3>Nothing to show yet</h3><p className="muted">This codebase has no finished scan.</p><button type="button" className="btn primary" onClick={rescan}><Icon name="scan" size={15} />Scan now</button></div>}
+          : <div className="empty"><h3>Nothing to show yet</h3><p className="muted">This codebase has no finished scan.</p>{mayScan(c) && <button type="button" className="btn primary" onClick={rescan}><Icon name="scan" size={15} />Scan now</button>}</div>}
       </div>
       {scanId && sp.get('path') !== null && <PathPanel key={sp.get('path')} path={sp.get('path') || ''} onClose={() => closeParam('path', 'line')} />}
       {scanId && sp.get('src') && <SourceView path={sp.get('src')!} line={Number(sp.get('line')) || 0} onClose={() => closeParam('src', 'line')} />}
       {editing && <EditCodebase c={c} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); reload(); setFetched(null) }} />}
+      {sharing && <ShareDialog c={c} onClose={() => setSharing(false)} onChange={() => { reload(); setFetched(null) }} />}
+      {leaving && <Confirm title={`Remove ${c.name}?`} message={`It is no longer shared with you. ${c.owner} keeps it, and can share it with you again; your notes on it are kept until then.`} confirmLabel="Remove"
+        onCancel={() => setLeaving(false)} onConfirm={async () => { const me = await api.get<{ id: number }>(`${V1}/auth/me`); await api.del(`${V1}/codebases/${c.id}/shares/${me.id}`); setLeaving(false); await reload(); navigate('/') }} />}
       {deleting && <Confirm title={`Delete ${c.name}?`} message="Its scans and notes are deleted, and the copy of the code Blueprint keeps (a clone or an archive). The code itself is not touched." confirmLabel="Delete"
         onCancel={() => setDeleting(false)} onConfirm={async () => { await api.del(`${V1}/codebases/${c.id}`); setDeleting(false); await reload(); navigate('/') }} />}
     </Ctx.Provider>

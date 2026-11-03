@@ -35,7 +35,13 @@ export interface Codebase {
   git_user: string; has_token: boolean; vendored: boolean; rescan_hours: number; pinned: boolean; last_scan_id: number | null
   created_at: string; updated_at: string
   latest?: Scan; done?: Scan
+  /** "owner", or how it is shared with you (then owner is whose it is) */
+  role: 'owner' | ShareRole; owner?: string; shares: number
 }
+
+export type ShareRole = 'view' | 'scan'
+export interface Share { user_id: number; name: string; email: string; role: ShareRole; created_at: string }
+export interface Person { id: number; name: string; email: string }
 
 export interface FileInfo {
   path: string; dir: string; lang: string; lines: number; code: number; bytes: number; package?: string

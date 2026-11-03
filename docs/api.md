@@ -13,6 +13,8 @@ JSON over HTTP under `/api/v1`. Authenticate with the session cookie, a personal
 | `POST /codebases/{id}/scan` | Queue a scan (`202`), or get the one already waiting (`200`) |
 | `GET /codebases/{id}/scans` | Every scan, newest first |
 | `GET/POST /codebases/{id}/notes`, `PUT/DELETE /notes/{id}` | Notes on a path (`?path=` filters; `""` = the whole codebase) |
+| `GET /codebases/{id}/shares`, `PUT/DELETE /codebases/{id}/shares/{uid}` | Who a codebase is shared with; share it (`{"role": "view" \| "scan"}`) or stop. The owner shares; anyone may remove themselves. Shared codebases are in `GET /codebases` with `role` and `owner` |
+| `GET /people` | Everyone else on this box, to share with |
 | `GET /search?q=&codebase=` | Files, symbols, endpoints, tables and variables in the latest scan of each codebase |
 | `GET /sources`, `/sources/browse?path=`, `/sources/files?space=&path=` | What can be scanned; folders on the server (admins) or in Pocket Files |
 
@@ -45,7 +47,7 @@ curl -H "Authorization: Bearer pbp_…" https://blueprint.example.com/api/v1/sca
 
 ## Pocket Core links
 
-Blueprint offers `blueprint:read` (codebases, scans and everything above except `source`, notes and AI) and `blueprint:write` (`POST /codebases` for git repositories, `POST /codebases/{id}/scan`). It uses Pocket Files with `files:read`. Events: `blueprint.scan_finished`, `blueprint.scan_failed` (`codebase_id`, `name`, `scan_id`, `url`, numbers or `error`, `user_email`).
+Blueprint offers `blueprint:read` (codebases, scans and everything above except `source`, notes and AI) and `blueprint:write` (`POST /codebases` for git repositories, `POST /codebases/{id}/scan`). It uses Pocket Files with `files:read`. Events: `blueprint.scan_finished`, `blueprint.scan_failed` (`codebase_id`, `name`, `scan_id`, `url`, numbers or `error`, `user_email`), `blueprint.shared` to the person a codebase is shared with (`codebase_id`, `name`, `role`, `by`, `url`). Links reach only the person's own codebases, not those shared with them.
 
 ## The rest
 

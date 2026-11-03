@@ -361,7 +361,7 @@ func (s *Server) handleExportJSON(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	uid := actorID(ctx)
 	doc := exportDoc{App: "pocket-blueprint", Version: Version, Exported: store.Now(), Codebases: []exportCodebase{}}
-	list, err := s.store.ListCodebases(ctx, uid)
+	list, err := s.store.OwnCodebases(ctx, uid)
 	if err != nil {
 		s.fail(w, err, "export")
 		return
@@ -391,7 +391,7 @@ func (s *Server) handleImportJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	u := userFrom(ctx)
-	existing, _ := s.store.ListCodebases(ctx, u.ID)
+	existing, _ := s.store.OwnCodebases(ctx, u.ID)
 	have := map[string]int64{}
 	for _, c := range existing {
 		have[c.Source+"|"+c.Location+"|"+c.Subdir] = c.ID

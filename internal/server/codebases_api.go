@@ -20,7 +20,7 @@ import (
 // ---- codebases ----
 
 func (s *Server) handleListCodebases(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListCodebases(r.Context(), actorID(r.Context()))
+	list, err := s.listCodebases(r.Context())
 	if err != nil {
 		s.fail(w, err, "codebases")
 		return
@@ -29,7 +29,7 @@ func (s *Server) handleListCodebases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCodebase(w http.ResponseWriter, r *http.Request) {
-	c, err := s.store.GetCodebase(r.Context(), actorID(r.Context()), idParam(r, "id"))
+	c, err := s.codebaseFor(r.Context(), idParam(r, "id"))
 	if err != nil {
 		s.fail(w, err, "codebase")
 		return
@@ -228,14 +228,19 @@ func (s *Server) handleDeleteCodebase(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleScanCodebase queues a new scan (or returns the one already waiting).
+// Its owner and those it is shared with to scan may; the scan is the owner's.
 func (s *Server) handleScanCodebase(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	uid := actorID(ctx)
-	c, err := s.store.GetCodebase(ctx, uid, idParam(r, "id"))
+	c, err := s.codebaseFor(ctx, idParam(r, "id"))
 	if err != nil {
 		s.fail(w, err, "codebase")
 		return
 	}
+	if !mayScan(c) {
+		writeErr(w, http.StatusForbidden, "this codebase is shared with you to look at; ask "+c.Owner+" to scan it")
+		return
+	}
+	uid := c.UserID
 	trigger := "manual"
 	if app := linkApp(ctx); app != "" {
 		trigger = "link:" + app
@@ -370,12 +375,12 @@ func archiveBase(name string) string {
 
 func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	uid := actorID(ctx)
-	if _, err := s.store.GetCodebase(ctx, uid, idParam(r, "id")); err != nil {
+	c, err := s.codebaseFor(ctx, idParam(r, "id"))
+	if err != nil {
 		s.fail(w, err, "codebase")
 		return
 	}
-	list, err := s.store.ListScans(ctx, uid, idParam(r, "id"))
+	list, err := s.store.ListScans(ctx, c.UserID, c.ID)
 	if err != nil {
 		s.fail(w, err, "scans")
 		return
@@ -386,7 +391,12 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancelScan(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	id := idParam(r, "id")
-	if err := s.store.CancelScan(ctx, actorID(ctx), id); err != nil {
+	sc, c, err := s.scanAccess(ctx, id)
+	if err != nil || !mayScan(c) {
+		s.fail(w, store.ErrNotFound, "cancel")
+		return
+	}
+	if err := s.store.CancelScan(ctx, c.UserID, sc.ID); err != nil {
 		s.fail(w, err, "cancel")
 		return
 	}

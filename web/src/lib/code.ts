@@ -4,6 +4,9 @@ import type { Codebase, Scan } from './types'
 export const SOURCE_LABEL: Record<string, string> = { path: 'Server folder', git: 'Git repository', upload: 'Uploaded archive', files: 'Pocket Files' }
 export const SOURCE_ICON: Record<string, string> = { path: 'server', git: 'git-branch', upload: 'archive', files: 'folder' }
 
+/** Whether the person may scan a codebase again: its owner, or shared with them to scan. */
+export const mayScan = (c: Codebase) => c.role !== 'view'
+
 export function where(c: Codebase): string {
   let w = c.location
   if (c.source === 'files') w = w.replace(/^home:/, 'My files: ').replace(/^mount:\d+:/, '').replace(/^share:\d+:/, 'Shared: ')

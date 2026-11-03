@@ -214,7 +214,7 @@ func (s *Server) coreLoop(ctx context.Context) {
 }
 
 // eventTopics are what Blueprint publishes on the Core bus.
-var eventTopics = []string{"blueprint.scan_finished", "blueprint.scan_failed"}
+var eventTopics = []string{"blueprint.scan_finished", "blueprint.scan_failed", "blueprint.shared"}
 
 func (s *Server) registerWithCore(ctx context.Context) error {
 	m := core.Manifest{
