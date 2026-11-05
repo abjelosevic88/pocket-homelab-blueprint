@@ -481,4 +481,4 @@ table.src tr.hl .ln { color: var(--accent-ink); font-weight: 600; }
 .share-list li + li { border-top: 1px solid var(--hairline); }
 .cb-shared { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .cb-shared-btn { display: inline-flex; align-items: center; gap: 4px; font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; white-space: nowrap; }
-.cb-shared-btn:hover { color: var(--accent-ink); text-decoration: underline; }
+.cb-shared-btn:hover { color: var(--accent-ink); }
