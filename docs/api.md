@@ -52,3 +52,5 @@ Blueprint offers `blueprint:read` (codebases, scans and everything above except 
 ## The rest
 
 `/auth/*`, `/users`, `/settings`, `/tokens`, `/backup` (admin), `/export.json`, `/import`, `/integrations/test`, `/ai/status`, `/ai/models` — as in every Pocket app. `/healthz`, `/readyz`, `/metrics` are public.
+
+Pocket Move can copy your codebases and notes out (`/export.json`) and bring them in (`POST /import`, the JSON as the body; a second run adds nothing). `GET /pocket/portable` describes this; links reach it with `move:export` / `move:import`.

@@ -25,6 +25,17 @@ var linkOffers = []core.Offer{
 	{Scope: "blueprint:write", Name: "Scan code for you", Description: "Add a git repository as a codebase and start a new scan of a codebase (Pocket Projects scanning a team's repository, Pocket AI looking at fresh code). It cannot delete anything."},
 }
 
+// portable is what Pocket Move may copy out and bring in for a person
+// (docs/move.md in pocket-homelab-core); Register adds move:export/import.
+var portable = &core.Portable{
+	Exports: []core.PortableExport{
+		{Path: "/api/v1/export.json", File: "blueprint.json", Kind: core.KindPocket, Title: "Your codebases (where their code comes from, never git tokens) and your notes on them"},
+	},
+	Imports: []core.PortableImport{
+		{Path: "/api/v1/import", Kind: core.KindPocket, ContentType: "application/json", MaxBytes: 32 << 20, Title: "Adds the codebases and notes from another box; codebases you already have keep theirs, notes are not repeated"},
+	},
+}
+
 type linkRoute struct {
 	methods string
 	path    *regexp.Regexp
@@ -44,6 +55,9 @@ var errLinkScope = errors.New("outside the link's scope")
 
 // linkAllows reports whether a link token with these scopes may make this request.
 func linkAllows(scopes []string, r *http.Request) bool {
+	if portable.LinkAllows(scopes, r) {
+		return true
+	}
 	for _, lr := range linkRoutes {
 		if !strings.Contains(" "+lr.methods+" ", " "+r.Method+" ") || !lr.path.MatchString(r.URL.Path) {
 			continue
